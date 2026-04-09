@@ -102,7 +102,23 @@ def extraer_datos(pdf_bytes):
     return json.loads(texto.strip()), img_bytes
 
 
-def generar_excel(resultados, recortes):
+def incrustar_imagen(ws, img_bytes, col, row, img_width=350):
+    """Incrusta una imagen en la celda indicada del worksheet."""
+    img_pil = Image.open(io.BytesIO(img_bytes))
+    ratio = img_width / img_pil.width
+    new_h = int(img_pil.height * ratio)
+    img_pil = img_pil.resize((img_width, new_h), Image.LANCZOS)
+    img_buf = io.BytesIO()
+    img_pil.save(img_buf, format="PNG")
+    img_buf.seek(0)
+
+    xl_img = XLImage(img_buf)
+    xl_img.width = img_width
+    xl_img.height = new_h
+    ws.add_image(xl_img, f"{get_column_letter(col)}{row}")
+
+
+def generar_excel(resultados, recortes_cuenta, recortes_nombre):
     """Genera el Excel en memoria y lo devuelve como bytes."""
     columnas = ["archivo", "nombre_completo", "cuenta", "clabe", "banco", "tipo"]
     df = pd.DataFrame(resultados)[columnas]
@@ -114,29 +130,24 @@ def generar_excel(resultados, recortes):
     wb = load_workbook(buf_excel)
     ws = wb.active
 
-    COL_IMG = 8
+    COL_NOMBRE = 8
+    COL_CUENTA = 9
     IMG_WIDTH = 350
     ROW_HEIGHT = 90
 
-    ws.cell(row=1, column=COL_IMG, value="recorte_cuenta")
-    ws.column_dimensions[get_column_letter(COL_IMG)].width = 50
+    ws.cell(row=1, column=COL_NOMBRE, value="recorte_nombre")
+    ws.cell(row=1, column=COL_CUENTA, value="recorte_cuenta")
+    ws.column_dimensions[get_column_letter(COL_NOMBRE)].width = 50
+    ws.column_dimensions[get_column_letter(COL_CUENTA)].width = 50
 
     for idx, fila in enumerate(resultados, start=2):
         ws.row_dimensions[idx].height = ROW_HEIGHT
-        recorte_bytes = recortes.get(fila["archivo"])
-        if recorte_bytes:
-            img_pil = Image.open(io.BytesIO(recorte_bytes))
-            ratio = IMG_WIDTH / img_pil.width
-            new_h = int(img_pil.height * ratio)
-            img_pil = img_pil.resize((IMG_WIDTH, new_h), Image.LANCZOS)
-            img_buf = io.BytesIO()
-            img_pil.save(img_buf, format="PNG")
-            img_buf.seek(0)
-
-            xl_img = XLImage(img_buf)
-            xl_img.width = IMG_WIDTH
-            xl_img.height = new_h
-            ws.add_image(xl_img, f"{get_column_letter(COL_IMG)}{idx}")
+        nombre_bytes = recortes_nombre.get(fila["archivo"])
+        cuenta_bytes = recortes_cuenta.get(fila["archivo"])
+        if nombre_bytes:
+            incrustar_imagen(ws, nombre_bytes, COL_NOMBRE, idx, IMG_WIDTH)
+        if cuenta_bytes:
+            incrustar_imagen(ws, cuenta_bytes, COL_CUENTA, idx, IMG_WIDTH)
 
     out = io.BytesIO()
     wb.save(out)
@@ -155,7 +166,8 @@ if archivos:
 
     if st.button("🚀 Procesar", type="primary"):
         resultados = []
-        recortes = {}
+        recortes_cuenta = {}
+        recortes_nombre = {}
         barra = st.progress(0, text="Iniciando...")
 
         for i, archivo in enumerate(archivos):
@@ -176,22 +188,29 @@ if archivos:
                 resultados.append(fila)
 
                 bbox_cuenta = datos.get("cuenta", {}).get("bbox", [0, 0, 0, 0])
-                recorte_bytes = recortar_zona(img_bytes, bbox_cuenta)
-                if recorte_bytes:
-                    recortes[nombre] = recorte_bytes
+                recorte_cuenta = recortar_zona(img_bytes, bbox_cuenta)
+                if recorte_cuenta:
+                    recortes_cuenta[nombre] = recorte_cuenta
+
+                bbox_nombre = datos.get("nombre_completo", {}).get("bbox", [0, 0, 0, 0])
+                recorte_nombre = recortar_zona(img_bytes, bbox_nombre)
+                if recorte_nombre:
+                    recortes_nombre[nombre] = recorte_nombre
 
                 # Mostrar resultado individual
                 with st.expander(f"✅ {nombre}", expanded=False):
-                    c1, c2 = st.columns([1, 1])
+                    st.markdown(f"**Nombre:** {fila['nombre_completo']}")
+                    st.markdown(f"**Cuenta:** {fila['cuenta']}")
+                    st.markdown(f"**CLABE:** {fila['clabe']}")
+                    st.markdown(f"**Banco:** {fila['banco']}")
+                    st.markdown(f"**Tipo:** {fila['tipo']}")
+                    c1, c2 = st.columns(2)
                     with c1:
-                        st.markdown(f"**Nombre:** {fila['nombre_completo']}")
-                        st.markdown(f"**Cuenta:** {fila['cuenta']}")
-                        st.markdown(f"**CLABE:** {fila['clabe']}")
-                        st.markdown(f"**Banco:** {fila['banco']}")
-                        st.markdown(f"**Tipo:** {fila['tipo']}")
+                        if recorte_nombre:
+                            st.image(recorte_nombre, caption="Recorte de nombre")
                     with c2:
-                        if recorte_bytes:
-                            st.image(recorte_bytes, caption="Recorte de cuenta")
+                        if recorte_cuenta:
+                            st.image(recorte_cuenta, caption="Recorte de cuenta")
 
             except Exception as e:
                 st.error(f"❌ Error en {nombre}: {e}")
@@ -217,7 +236,7 @@ if archivos:
             )
 
             # Generar y ofrecer descarga del Excel
-            excel_bytes = generar_excel(resultados, recortes)
+            excel_bytes = generar_excel(resultados, recortes_cuenta, recortes_nombre)
             st.download_button(
                 label="📥 Descargar Excel",
                 data=excel_bytes,
