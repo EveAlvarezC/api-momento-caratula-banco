@@ -184,7 +184,10 @@ if archivos:
                 fila = {"archivo": nombre}
                 for campo in ["nombre_completo", "cuenta", "clabe", "banco", "tipo"]:
                     v = datos.get(campo, {}).get("valor", "Verificar")
-                    fila[campo] = v if v else "Verificar"
+                    v = v if v else "Verificar"
+                    if campo in ("cuenta", "clabe"):
+                        v = v.replace(" ", "")
+                    fila[campo] = v
                 resultados.append(fila)
 
                 bbox_cuenta = datos.get("cuenta", {}).get("bbox", [0, 0, 0, 0])
