@@ -1,5 +1,5 @@
 import streamlit as st
-import json, io, pathlib, zipfile
+import json, io, pathlib, zipfile, traceback, time, random
 import pandas as pd
 import fitz
 from PIL import Image
@@ -85,21 +85,43 @@ def recortar_zona(img_bytes, bbox, margen_h=150, margen_v=100, min_w=600, min_h=
     return buf.getvalue()
 
 
+def llamar_gemini_con_reintento(img_bytes, max_intentos=5):
+    """Llama a Gemini con reintentos exponenciales ante 429 (rate limit)."""
+    for intento in range(max_intentos):
+        try:
+            return client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=[
+                    types.Part.from_bytes(data=img_bytes, mime_type="image/png"),
+                    types.Part.from_text(text=PROMPT),
+                ],
+            )
+        except Exception as e:
+            mensaje = str(e)
+            es_rate_limit = "429" in mensaje or "RESOURCE_EXHAUSTED" in mensaje
+            if es_rate_limit and intento < max_intentos - 1:
+                espera = (2 ** intento) * 5 + random.uniform(0, 2)
+                time.sleep(espera)
+                continue
+            raise
+
+
 def extraer_datos(pdf_bytes):
     img_bytes = pdf_primera_pagina(pdf_bytes)
-    response = client.models.generate_content(
-        model="gemini-2.0-flash",
-        contents=[
-            types.Part.from_bytes(data=img_bytes, mime_type="image/png"),
-            types.Part.from_text(text=PROMPT),
-        ],
-    )
-    texto = response.text.strip()
+    response = llamar_gemini_con_reintento(img_bytes)
+    texto_original = response.text or ""
+    texto = texto_original.strip()
     if texto.startswith("```"):
         texto = texto.split("```")[1]
         if texto.startswith("json"):
             texto = texto[4:]
-    return json.loads(texto.strip()), img_bytes
+    try:
+        return json.loads(texto.strip()), img_bytes, texto_original
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"Gemini devolvió una respuesta que no es JSON válido.\n"
+            f"Error: {e}\n\n--- Respuesta cruda ---\n{texto_original[:2000]}"
+        )
 
 
 def incrustar_imagen(ws, img_bytes, col, row, img_width=350):
@@ -177,9 +199,13 @@ if archivos:
                 text=f"Procesando {nombre} ({i+1}/{len(archivos)})...",
             )
 
+            # Pequeña pausa entre archivos para respetar el rate limit (~15 req/min del tier gratis)
+            if i > 0:
+                time.sleep(4)
+
             try:
                 pdf_bytes = archivo.read()
-                datos, img_bytes = extraer_datos(pdf_bytes)
+                datos, img_bytes, _respuesta = extraer_datos(pdf_bytes)
 
                 fila = {"archivo": nombre}
                 for campo in ["nombre_completo", "cuenta", "clabe", "banco", "tipo"]:
@@ -216,7 +242,11 @@ if archivos:
                             st.image(recorte_cuenta, caption="Recorte de cuenta")
 
             except Exception as e:
-                st.error(f"❌ Error en {nombre}: {e}")
+                with st.expander(f"❌ Error en {nombre} — clic para ver detalle", expanded=False):
+                    st.error(f"**Tipo:** `{type(e).__name__}`")
+                    st.code(str(e), language="text")
+                    st.caption("Traceback completo:")
+                    st.code(traceback.format_exc(), language="python")
                 resultados.append({
                     "archivo": nombre,
                     "nombre_completo": "Verificar",
