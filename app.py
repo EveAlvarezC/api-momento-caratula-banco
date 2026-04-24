@@ -1,10 +1,11 @@
 import streamlit as st
-import json, io, pathlib, zipfile, traceback, time, random
+import json, io, pathlib, zipfile, traceback, time, random, base64
 import pandas as pd
 import fitz
 from PIL import Image
 from google import genai
 from google.genai import types
+import anthropic
 from openpyxl import load_workbook
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.utils import get_column_letter
@@ -14,12 +15,39 @@ st.set_page_config(page_title="Extractor de Cuentas Bancarias", layout="wide")
 st.title("📄 Extractor de Datos Bancarios")
 st.write("Sube los PDFs de carátulas bancarias y descarga un Excel con los datos extraídos.")
 
-# ── API Key desde secrets ────────────────────────────────────────────
-if "GEMINI_API_KEY" not in st.secrets:
-    st.error("⚠️ Falta configurar la API Key de Gemini en los Secrets de la app.")
+# ── API Keys desde secrets ───────────────────────────────────────────
+tiene_gemini = "GEMINI_API_KEY" in st.secrets
+tiene_claude = "ANTHROPIC_API_KEY" in st.secrets
+
+if not tiene_gemini and not tiene_claude:
+    st.error("⚠️ Falta configurar al menos una API Key (GEMINI_API_KEY o ANTHROPIC_API_KEY) en los Secrets.")
     st.stop()
 
-client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+# ── Autenticación por contraseña ─────────────────────────────────────
+def verificar_password():
+    """Pide contraseña y bloquea la app si no coincide con la guardada en Secrets."""
+    if "APP_PASSWORD" not in st.secrets:
+        st.error("⚠️ Falta configurar APP_PASSWORD en los Secrets de la app.")
+        st.stop()
+
+    if st.session_state.get("autenticado"):
+        return
+
+    st.subheader("🔒 Acceso restringido")
+    password = st.text_input("Contraseña", type="password")
+    if st.button("Entrar"):
+        if password == st.secrets["APP_PASSWORD"]:
+            st.session_state["autenticado"] = True
+            st.rerun()
+        else:
+            st.error("Contraseña incorrecta.")
+    st.stop()
+
+
+verificar_password()
+
+cliente_gemini = genai.Client(api_key=st.secrets["GEMINI_API_KEY"]) if tiene_gemini else None
+cliente_claude = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"]) if tiene_claude else None
 
 # ── Prompt para Gemini ───────────────────────────────────────────────
 PROMPT = """
@@ -89,13 +117,14 @@ def llamar_gemini_con_reintento(img_bytes, max_intentos=5):
     """Llama a Gemini con reintentos exponenciales ante 429 (rate limit)."""
     for intento in range(max_intentos):
         try:
-            return client.models.generate_content(
+            response = cliente_gemini.models.generate_content(
                 model="gemini-2.0-flash",
                 contents=[
                     types.Part.from_bytes(data=img_bytes, mime_type="image/png"),
                     types.Part.from_text(text=PROMPT),
                 ],
             )
+            return response.text or ""
         except Exception as e:
             mensaje = str(e)
             es_rate_limit = "429" in mensaje or "RESOURCE_EXHAUSTED" in mensaje
@@ -106,10 +135,51 @@ def llamar_gemini_con_reintento(img_bytes, max_intentos=5):
             raise
 
 
-def extraer_datos(pdf_bytes):
+def llamar_claude_con_reintento(img_bytes, max_intentos=5):
+    """Llama a Claude con reintentos exponenciales ante 429."""
+    img_b64 = base64.standard_b64encode(img_bytes).decode("utf-8")
+    for intento in range(max_intentos):
+        try:
+            response = cliente_claude.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=1024,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": img_b64,
+                            },
+                        },
+                        {"type": "text", "text": PROMPT},
+                    ],
+                }],
+            )
+            return response.content[0].text or ""
+        except anthropic.RateLimitError:
+            if intento < max_intentos - 1:
+                espera = (2 ** intento) * 5 + random.uniform(0, 2)
+                time.sleep(espera)
+                continue
+            raise
+        except anthropic.APIStatusError as e:
+            if e.status_code == 429 and intento < max_intentos - 1:
+                espera = (2 ** intento) * 5 + random.uniform(0, 2)
+                time.sleep(espera)
+                continue
+            raise
+
+
+def extraer_datos(pdf_bytes, proveedor):
     img_bytes = pdf_primera_pagina(pdf_bytes)
-    response = llamar_gemini_con_reintento(img_bytes)
-    texto_original = response.text or ""
+    if proveedor == "Gemini":
+        texto_original = llamar_gemini_con_reintento(img_bytes)
+    else:
+        texto_original = llamar_claude_con_reintento(img_bytes)
+
     texto = texto_original.strip()
     if texto.startswith("```"):
         texto = texto.split("```")[1]
@@ -119,7 +189,7 @@ def extraer_datos(pdf_bytes):
         return json.loads(texto.strip()), img_bytes, texto_original
     except json.JSONDecodeError as e:
         raise ValueError(
-            f"Gemini devolvió una respuesta que no es JSON válido.\n"
+            f"{proveedor} devolvió una respuesta que no es JSON válido.\n"
             f"Error: {e}\n\n--- Respuesta cruda ---\n{texto_original[:2000]}"
         )
 
@@ -177,6 +247,19 @@ def generar_excel(resultados, recortes_cuenta, recortes_nombre):
 
 
 # ── Interfaz ─────────────────────────────────────────────────────────
+opciones_modelo = []
+if tiene_gemini:
+    opciones_modelo.append("Gemini")
+if tiene_claude:
+    opciones_modelo.append("Claude")
+
+proveedor = st.radio(
+    "Modelo a usar",
+    opciones_modelo,
+    horizontal=True,
+    help="Si uno se agota por cuota, cambia al otro.",
+)
+
 archivos = st.file_uploader(
     "Sube los PDFs de carátulas bancarias",
     type=["pdf"],
@@ -205,7 +288,7 @@ if archivos:
 
             try:
                 pdf_bytes = archivo.read()
-                datos, img_bytes, _respuesta = extraer_datos(pdf_bytes)
+                datos, img_bytes, _respuesta = extraer_datos(pdf_bytes, proveedor)
 
                 fila = {"archivo": nombre}
                 for campo in ["nombre_completo", "cuenta", "clabe", "banco", "tipo"]:
